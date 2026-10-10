@@ -1,0 +1,85 @@
+name: Nettoyage du stockage GitHub Actions
+
+on:
+  push:
+    paths:
+      - ".github/workflows/cleanup-actions-storage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: cleanup-actions-storage
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Garder les 3 derniers builds avec artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Supprimer les anciens artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+
+            // Ne toucher ni au code ni aux workflows, seulement aux artifacts.
+            // Un build peut contenir plusieurs artifacts : on les groupe par run.
+            const active = artifacts.filter(a => !a.expired);
+            const groups = new Map();
+            for (const artifact of active) {
+              const runId = artifact.workflow_run?.id;
+              const key = runId ? 'run:' + runId : 'artifact:' + artifact.id;
+              const time = Date.parse(artifact.created_at || '') || 0;
+              const old = groups.get(key);
+              if (!old || time > old.time) groups.set(key, { key, time });
+            }
+
+            // Garder tous les fichiers des 3 derniers builds ayant des artifacts.
+            const latest = [...groups.values()]
+              .sort((a, b) => b.time - a.time)
+              .slice(0, 3);
+            const protectedKeys = new Set(latest.map(g => g.key));
+            const targets = active.filter(a => {
+              const id = a.workflow_run?.id;
+              const key = id ? 'run:' + id : 'artifact:' + a.id;
+              return !protectedKeys.has(key);
+            });
+
+            let deleted = 0;
+            let bytes = 0;
+            const errors = [];
+            for (const artifact of targets) {
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner, repo, artifact_id: artifact.id
+                });
+                deleted++;
+                bytes += artifact.size_in_bytes || 0;
+              } catch (err) {
+                errors.push(artifact.id + ': ' + err.message);
+                core.warning('Artifact ' + artifact.id + ': ' + err.message);
+              }
+            }
+
+            const freedMiB = (bytes / (1024 * 1024)).toFixed(1);
+            core.info('Artifacts trouves : ' + active.length);
+            core.info('Builds conserves : ' + latest.length);
+            core.info('Artifacts supprimes : ' + deleted);
+            core.info('Volume supprime estime : ' + freedMiB + ' Mio');
+            await core.summary
+              .addHeading('Nettoyage GitHub Actions')
+              .addRaw('Depot : ' + owner + '/' + repo + '\n\n')
+              .addRaw('Builds conserves : ' + latest.length + '\n\n')
+              .addRaw('Artifacts supprimes : ' + deleted + '\n\n')
+              .addRaw('Volume supprime estime : ' + freedMiB + ' Mio\n\n')
+              .addRaw('Erreurs : ' + errors.length + '\n')
+              .write();
+            if (errors.length) core.setFailed('Echec pour ' + errors.length + ' artifact(s).');
