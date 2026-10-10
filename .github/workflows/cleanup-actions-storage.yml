@@ -16,70 +16,61 @@ concurrency:
 
 jobs:
   cleanup:
-    name: Garder les 3 derniers builds avec artifacts
+    name: Supprimer les anciennes executions (garder les 3 dernieres)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - name: Supprimer les anciens artifacts
+      - name: Supprimer les anciens runs et leurs artifacts
         uses: actions/github-script@v7
         with:
           script: |
             const { owner, repo } = context.repo;
-            const artifacts = await github.paginate(
-              github.rest.actions.listArtifactsForRepo,
+            const keepCount = 3;
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
               { owner, repo, per_page: 100 }
             );
-
-            // Ne toucher ni au code ni aux workflows, seulement aux artifacts.
-            // Un build peut contenir plusieurs artifacts : on les groupe par run.
-            const active = artifacts.filter(a => !a.expired);
-            const groups = new Map();
-            for (const artifact of active) {
-              const runId = artifact.workflow_run?.id;
-              const key = runId ? 'run:' + runId : 'artifact:' + artifact.id;
-              const time = Date.parse(artifact.created_at || '') || 0;
-              const old = groups.get(key);
-              if (!old || time > old.time) groups.set(key, { key, time });
-            }
-
-            // Garder tous les fichiers des 3 derniers builds ayant des artifacts.
-            const latest = [...groups.values()]
-              .sort((a, b) => b.time - a.time)
-              .slice(0, 3);
-            const protectedKeys = new Set(latest.map(g => g.key));
-            const targets = active.filter(a => {
-              const id = a.workflow_run?.id;
-              const key = id ? 'run:' + id : 'artifact:' + a.id;
-              return !protectedKeys.has(key);
+            runs.sort((a, b) => {
+              const dateOrder = Date.parse(b.created_at) - Date.parse(a.created_at);
+              return dateOrder || b.id - a.id;
             });
 
+            // Garder les trois runs les plus recents, plus le run actuel.
+            // Ne jamais interrompre une execution en cours.
+            const protectedIds = new Set(runs.slice(0, keepCount).map(r => r.id));
+            protectedIds.add(context.runId);
+            const deletable = runs.filter(r =>
+              r.status === 'completed' && !protectedIds.has(r.id)
+            );
+
             let deleted = 0;
-            let bytes = 0;
-            const errors = [];
-            for (const artifact of targets) {
+            const failures = [];
+            for (const run of deletable) {
               try {
-                await github.rest.actions.deleteArtifact({
-                  owner, repo, artifact_id: artifact.id
+                await github.rest.actions.deleteWorkflowRun({
+                  owner, repo, run_id: run.id
                 });
                 deleted++;
-                bytes += artifact.size_in_bytes || 0;
-              } catch (err) {
-                errors.push(artifact.id + ': ' + err.message);
-                core.warning('Artifact ' + artifact.id + ': ' + err.message);
+              } catch (error) {
+                failures.push('Run #' + run.id + ': ' + error.message);
+                core.warning('Impossible de supprimer ' + run.id + ': ' + error.message);
               }
             }
 
-            const freedMiB = (bytes / (1024 * 1024)).toFixed(1);
-            core.info('Artifacts trouves : ' + active.length);
-            core.info('Builds conserves : ' + latest.length);
-            core.info('Artifacts supprimes : ' + deleted);
-            core.info('Volume supprime estime : ' + freedMiB + ' Mio');
+            // Les runs supprimes ne sont plus affiches dans Actions.
+            // Leurs logs et les artifacts rattaches sont egalement supprimes.
+            core.info('Executions trouvees : ' + runs.length);
+            core.info('Executions protegees : ' + protectedIds.size);
+            core.info('Anciennes executions supprimees : ' + deleted);
+
             await core.summary
-              .addHeading('Nettoyage GitHub Actions')
+              .addHeading('Nettoyage de l\'historique GitHub Actions')
               .addRaw('Depot : ' + owner + '/' + repo + '\n\n')
-              .addRaw('Builds conserves : ' + latest.length + '\n\n')
-              .addRaw('Artifacts supprimes : ' + deleted + '\n\n')
-              .addRaw('Volume supprime estime : ' + freedMiB + ' Mio\n\n')
-              .addRaw('Erreurs : ' + errors.length + '\n')
+              .addRaw('Executions trouvees : ' + runs.length + '\n\n')
+              .addRaw('Executions supprimees : ' + deleted + '\n\n')
+              .addRaw('Executions recentes conservees : au moins ' + Math.min(keepCount, runs.length) + '\n\n')
+              .addRaw('Erreurs : ' + failures.length + '\n')
               .write();
-            if (errors.length) core.setFailed('Echec pour ' + errors.length + ' artifact(s).');
+            if (failures.length) {
+              core.setFailed('Erreur lors de la suppression de ' + failures.length + ' execution(s)');
+            }
